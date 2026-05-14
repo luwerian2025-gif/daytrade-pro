@@ -86,7 +86,6 @@
   .si-tag{font-size:9px;padding:2px 6px;border-radius:10px;font-weight:600;white-space:nowrap;}
   .tag-hot{background:#431407;color:var(--orange);}
   .tag-tech{background:#1e1b4b;color:#a5b4fc;}
-  .tag-etf{background:#064e3b;color:#6ee7b7);}
   .tag-etf{background:#064e3b;color:#6ee7b7;}
   .tag-val{background:#1c1917;color:#d6d3d1;}
   .si-add{background:var(--bg3);border:1px solid var(--border);color:var(--muted);border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;transition:all .15s;flex-shrink:0;}
@@ -256,7 +255,7 @@
     <!-- Watchlist -->
     <div class="sidebar-section">
       <div class="sidebar-title">My Watchlist <button id="add-btn">+ Add</button></div>
-      <div id="watchlist"><div class="empty-state" id="empty-hint">Add tickers or pick from Suggested below.</div></div>
+      <div id="watchlist"><div class="empty-state">Add tickers or pick from<br>Suggested Stocks below.</div></div>
     </div>
 
     <!-- Suggested Stocks -->
@@ -698,9 +697,10 @@ async function loadQuote(ticker) {
 
 function renderWatchlist() {
   const el = document.getElementById('watchlist');
-  const empty = document.getElementById('empty-hint');
-  if (!state.watchlist.length) { el.innerHTML=''; el.appendChild(empty); return; }
-  if (el.contains(empty)) el.removeChild(empty);
+  if (!state.watchlist.length) {
+    el.innerHTML = '<div class="empty-state">Add tickers or pick from<br>Suggested Stocks below.</div>';
+    return;
+  }
   el.innerHTML = state.watchlist.map(s => {
     const price = s.price!=null ? `$${s.price.toFixed(2)}` : '—';
     const pCls = s.changePct>0?'pos':s.changePct<0?'neg':'neu';
