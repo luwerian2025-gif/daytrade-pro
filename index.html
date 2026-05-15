@@ -159,7 +159,8 @@ header{
 ═══════════════════════════════════════════════ */
 .sidebar{
   width:var(--sidebar);flex-shrink:0;background:var(--bg2);
-  border-right:1px solid var(--b1);display:flex;flex-direction:column;overflow:hidden;
+  border-right:1px solid var(--b1);display:flex;flex-direction:column;
+  overflow-y:auto;overflow-x:hidden;
 }
 .pnl-hdr{
   padding:9px 14px;display:flex;align-items:center;
@@ -173,8 +174,30 @@ header{
 }
 .pnl-act:hover{background:var(--acd);border-color:var(--ac);}
 
+/* Inline add bar */
+.wl-add-bar{
+  display:flex;align-items:center;gap:6px;
+  padding:6px 10px;border-bottom:1px solid var(--b1);
+  background:var(--bg1);flex-shrink:0;
+}
+.wl-add-input{
+  flex:1;background:var(--bg3);border:1px solid var(--b1);
+  color:var(--t1);border-radius:6px;padding:5px 9px;
+  font-size:12px;font-family:var(--ff-num);letter-spacing:1px;
+  text-transform:uppercase;outline:none;transition:border-color .15s;
+  min-width:0;
+}
+.wl-add-input:focus{border-color:var(--ac);}
+.wl-add-input::placeholder{text-transform:none;letter-spacing:0;font-family:var(--ff-ui);color:var(--t4);font-size:11px;}
+.wl-add-btn{
+  background:var(--acd);border:1px solid var(--ac);color:var(--ac);
+  border-radius:6px;padding:5px 10px;font-size:13px;font-weight:700;
+  cursor:pointer;transition:all .15s;flex-shrink:0;line-height:1;
+}
+.wl-add-btn:hover{background:var(--ac);color:#000;}
+
 /* Watchlist */
-#wl{overflow-y:auto;max-height:245px;}
+#wl{overflow-y:auto;max-height:220px;}
 .wl-item{
   padding:8px 14px 7px;cursor:pointer;
   border-left:2px solid transparent;
@@ -517,7 +540,8 @@ header{
 /* ═══════════════════════════════════════════════
    AUTO BUY SIGNALS PANEL
 ═══════════════════════════════════════════════ */
-.hp-wrap{border-top:1px solid var(--b1);padding-bottom:8px;}
+.hp-wrap{border-top:1px solid var(--b1);padding-bottom:8px;flex-shrink:0;}
+#hp-body{max-height:260px;overflow-y:auto;}
 .hp-sub{
   display:flex;align-items:center;justify-content:space-between;
   padding:4px 12px 6px;font-size:11px;color:var(--t3);
@@ -605,8 +629,14 @@ header{
   <aside class="sidebar">
     <div>
       <div class="pnl-hdr">
-        <span class="pnl-ttl">Watchlist</span>
-        <button class="pnl-act" id="add-btn">+ Add</button>
+        <span class="pnl-ttl">My Watchlist</span>
+        <span class="pnl-ttl" id="wl-count" style="color:var(--t4)">0 stocks</span>
+      </div>
+      <div class="wl-add-bar">
+        <input class="wl-add-input" id="wl-add-input"
+               type="text" placeholder="Add ticker… e.g. AAPL"
+               maxlength="10" autocomplete="off" spellcheck="false">
+        <button class="wl-add-btn" id="wl-add-btn" title="Add to watchlist">+</button>
       </div>
       <div id="wl"></div>
     </div>
@@ -710,11 +740,8 @@ const CATALOGUE = [
 ];
 const DEFAULT_WL = ['AAPL','NVDA','TSLA','SPY','AMD'];
 
-// Priority tickers scanned automatically for buy signals
-const AUTO_SCAN_TICKERS = [
-  'NVDA','TSLA','AMD','AAPL','META',
-  'SPY','PLTR','COIN','MSFT','QQQ',
-];
+// Priority tickers scanned automatically for buy signals (kept small to preserve daily call quota)
+const AUTO_SCAN_TICKERS = ['NVDA','TSLA','AMD','SPY','AAPL'];
 
 // ════════════════════════════════════════════════════
 //  STATE
@@ -731,6 +758,7 @@ const S = {
   hotPicks: [],       // auto-detected buy signals
   autoScanning: false,
   lastAutoScan: null,
+  scanCancel: false,
 };
 
 // ════════════════════════════════════════════════════
@@ -748,6 +776,34 @@ function toast(msg, type='info', dur=3000) {
   t.textContent = msg; t.className = `toast ${type} show`;
   clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), dur);
 }
+
+// ════════════════════════════════════════════════════
+//  SMART RATE LIMITER  (Alpha Vantage: 5 calls/min)
+// ════════════════════════════════════════════════════
+const RL = {
+  lastCall: 0,
+  minGap: 12500,   // 12.5 s between calls (safe under 5/min)
+  async wait() {
+    const gap = this.minGap - (Date.now() - this.lastCall);
+    if (gap > 0) await sleep(gap);
+    this.lastCall = Date.now();
+  },
+  stamp() { this.lastCall = Date.now(); },  // call this after a fetch
+};
+
+// ════════════════════════════════════════════════════
+//  QUOTE CACHE  (90-second TTL to avoid redundant calls)
+// ════════════════════════════════════════════════════
+const QC = {
+  _store: {},
+  ttl: 90000,
+  get(ticker) {
+    const e = this._store[ticker];
+    return e && Date.now() - e.ts < this.ttl ? e.data : null;
+  },
+  set(ticker, data) { this._store[ticker] = { data, ts: Date.now() }; },
+  clear() { this._store = {}; },
+};
 
 function sparklineSVG(prices, w=44, h=22) {
   if (!prices || prices.length < 2) return '';
@@ -976,23 +1032,29 @@ function updateCallCt() {
 async function apiFetch(params) {
   const key = getKey();
   if (!key) { toast('Enter your Alpha Vantage API key', 'err'); return null; }
+  await RL.wait();          // Smart rate limiter: only waits the remaining gap
   const url = new URL('https://www.alphavantage.co/query');
   url.searchParams.set('apikey', key);
-  for (const [k,v] of Object.entries(params)) url.searchParams.set(k, v);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   try {
-    const r = await fetch(url); const d = await r.json();
+    const r = await fetch(url);
+    const d = await r.json();
+    RL.stamp();             // Record time of successful call
     S.calls++; updateCallCt(); saveState();
     if (d['Note'] || d['Information']) {
-      toast('API rate limit — wait 60s then retry', 'warn'); return null;
+      toast('API rate limit hit — slow down or wait 60s', 'warn'); return null;
     }
     return d;
   } catch(e) { toast('Network error — check connection', 'err'); return null; }
 }
+
 async function fetchQuote(ticker) {
+  const cached = QC.get(`q:${ticker}`);
+  if (cached) return cached;
   const d = await apiFetch({ function:'GLOBAL_QUOTE', symbol:ticker });
   if (!d || !d['Global Quote'] || !d['Global Quote']['05. price']) return null;
   const q = d['Global Quote'];
-  return {
+  const result = {
     ticker,
     price:    parseFloat(q['05. price']),
     open:     parseFloat(q['02. open']),
@@ -1003,8 +1065,14 @@ async function fetchQuote(ticker) {
     change:   parseFloat(q['09. change']),
     changePct:parseFloat(q['10. change percent']),
   };
+  QC.set(`q:${ticker}`, result);
+  return result;
 }
+
 async function fetchIntraday(ticker, interval='5min') {
+  const cacheKey = `i:${ticker}:${interval}`;
+  const cached = QC.get(cacheKey);
+  if (cached) return cached;
   const d = await apiFetch({
     function:'TIME_SERIES_INTRADAY', symbol:ticker,
     interval, outputsize:'compact',
@@ -1012,17 +1080,19 @@ async function fetchIntraday(ticker, interval='5min') {
   if (!d) return null;
   const key = `Time Series (${interval})`;
   if (!d[key]) return null;
-  return Object.entries(d[key])
-    .sort((a,b) => a[0].localeCompare(b[0]))
+  const result = Object.entries(d[key])
+    .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([time, v]) => ({
       time,
-      ts: Math.floor(new Date(time.replace(' ','T')).getTime()/1000),
+      ts: Math.floor(new Date(time.replace(' ', 'T')).getTime() / 1000),
       open:  parseFloat(v['1. open']),
       high:  parseFloat(v['2. high']),
       low:   parseFloat(v['3. low']),
       close: parseFloat(v['4. close']),
       volume:parseInt(v['5. volume']),
     }));
+  QC.set(cacheKey, result);
+  return result;
 }
 
 // ════════════════════════════════════════════════════
@@ -1052,8 +1122,10 @@ async function loadQuote(ticker) {
 
 function renderWL() {
   const el = $('wl');
+  const ct = $('wl-count');
+  if (ct) ct.textContent = S.wl.length ? `${S.wl.length} stock${S.wl.length > 1 ? 's' : ''}` : '';
   if (!S.wl.length) {
-    el.innerHTML = `<div class="wl-empty">Add tickers or select from<br>Suggested Stocks below.</div>`;
+    el.innerHTML = `<div class="wl-empty">Type a ticker above and press Enter,<br>or pick from Suggested Stocks below.</div>`;
     return;
   }
   el.innerHTML = S.wl.map(s => {
@@ -1658,37 +1730,61 @@ function pushNotification(ticker, label, price, reason) {
 //  SCAN ALL
 // ════════════════════════════════════════════════════
 async function scanAll() {
-  if (!S.wl.length) { toast('Add stocks to your watchlist first','warn'); return; }
+  if (!S.wl.length) { toast('Add stocks to your watchlist first', 'warn'); return; }
   if (!getKey()) return;
-  if ('Notification' in window && Notification.permission==='default') Notification.requestPermission();
+  if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
 
-  const prog=$('scan-prog'), bar=$('prog-in'), txt=$('scan-txt');
-  if (!prog) { toast('Select a stock first to run Scan All','warn'); return; }
+  S.scanCancel = false;
+  const prog = $('scan-prog'), bar = $('prog-in'), txt = $('scan-txt');
+  if (!prog) { toast('Select a stock first to run Scan All', 'warn'); return; }
   prog.classList.add('show');
 
-  const total=S.wl.length; let done=0;
-  for (const s of [...S.wl]) {
-    txt.textContent=`Scanning ${s.ticker}… (${done+1}/${total})`;
-    bar.style.width=`${(done/total)*100}%`;
-    const [q,intra]=await Promise.all([fetchQuote(s.ticker),fetchIntraday(s.ticker,S.interval)]);
-    if(q&&intra&&intra.length>=26) {
-      const an=analyse(intra);
-      s.price=q.price; s.chg=q.change; s.chgPct=q.changePct;
-      s.signal=an.label; s.cls=an.cls;
-      s.spark=sparklineSVG(intra.slice(-30).map(d=>d.close));
-      fireAlert(s.ticker,q,an);
-      renderWL(); updateTape();
-      // If this is the currently selected ticker, refresh the chart
-      if (S.sel===s.ticker) updateChart(intra, an);
-    }
-    done++; bar.style.width=`${(done/total)*100}%`;
-    if (done<total) await sleep(13000);
+  // Inject cancel button if not already present
+  if (!$('scan-cancel')) {
+    const btn = document.createElement('button');
+    btn.id = 'scan-cancel';
+    btn.textContent = '✕ Cancel';
+    btn.style.cssText = 'background:none;border:1px solid var(--bear);color:var(--bear);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;margin-left:8px;flex-shrink:0;';
+    btn.onclick = () => { S.scanCancel = true; btn.textContent = 'Cancelling…'; btn.disabled = true; };
+    prog.appendChild(btn);
+  } else {
+    const b = $('scan-cancel'); b.textContent = '✕ Cancel'; b.disabled = false;
   }
-  bar.style.width='100%';
-  txt.textContent=`Scan complete — ${total} stocks analysed`;
-  setTimeout(()=>prog.classList.remove('show'),3000);
-  toast('Scan complete!','ok');
-  if(S.alerts.length) openDrawer();
+
+  const total = S.wl.length; let done = 0, found = 0;
+  for (const s of [...S.wl]) {
+    if (S.scanCancel) break;
+    txt.textContent = `Scanning ${s.ticker}… (${done + 1}/${total})`;
+    bar.style.width = `${(done / total) * 100}%`;
+
+    // Sequential calls — RL.wait() inside apiFetch handles the gap automatically
+    const q = await fetchQuote(s.ticker);
+    const intra = q ? await fetchIntraday(s.ticker, S.interval) : null;
+
+    if (q && intra && intra.length >= 26) {
+      const an = analyse(intra);
+      s.price = q.price; s.chg = q.change; s.chgPct = q.changePct;
+      s.signal = an.label; s.cls = an.cls;
+      s.spark = sparklineSVG(intra.slice(-30).map(d => d.close));
+      fireAlert(s.ticker, q, an);
+      if (an.cls === 'sb' || an.cls === 'b') found++;
+      renderWL(); updateTape();
+      if (S.sel === s.ticker) updateChart(intra, an);
+    }
+    done++;
+    bar.style.width = `${(done / total) * 100}%`;
+  }
+
+  bar.style.width = '100%';
+  const cancelled = S.scanCancel;
+  S.scanCancel = false;
+  txt.textContent = cancelled
+    ? `Scan cancelled (${done}/${total} done)`
+    : `Scan complete — ${found} signal${found !== 1 ? 's' : ''} found`;
+  setTimeout(() => prog.classList.remove('show'), 3500);
+  toast(cancelled ? 'Scan cancelled' : `Scan done · ${found} signal${found !== 1 ? 's' : ''} found`,
+        cancelled ? 'warn' : 'ok');
+  if (!cancelled && S.alerts.length) openDrawer();
 }
 
 // ════════════════════════════════════════════════════
@@ -1717,22 +1813,31 @@ function loadState() {
 // ════════════════════════════════════════════════════
 //  EVENT HANDLERS
 // ════════════════════════════════════════════════════
-$('add-btn').onclick = () => { $('modal-bg').classList.add('open'); setTimeout(()=>$('m-input').focus(),50); };
-$('m-cancel').onclick = closeModal;
-$('modal-bg').onclick = e => { if(e.target===$('modal-bg')) closeModal(); };
-$('m-input').onkeydown = e => { if(e.key==='Enter') doAdd(); };
-$('m-ok').onclick = doAdd;
-function closeModal() { $('modal-bg').classList.remove('open'); $('m-input').value=''; }
-function doAdd() { const v=$('m-input').value.trim().toUpperCase().replace(/[^A-Z.]/g,''); if(v){addTicker(v);closeModal();} }
+
+// Inline add-ticker bar (replaces modal)
+function doInlineAdd() {
+  const inp = $('wl-add-input');
+  const v = inp.value.trim().toUpperCase().replace(/[^A-Z.]/g, '');
+  if (!v) return;
+  addTicker(v);
+  inp.value = '';
+  inp.focus();
+}
+$('wl-add-btn').onclick = doInlineAdd;
+$('wl-add-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); doInlineAdd(); }
+  if (e.key === 'Escape') { $('wl-add-input').value = ''; }
+});
 
 $('ref-btn').onclick = async () => {
-  $('ref-btn').textContent='↻…'; $('ref-btn').disabled=true;
-  for (let i=0;i<S.wl.length;i++) {
+  if (!S.wl.length) { toast('Watchlist is empty', 'warn'); return; }
+  $('ref-btn').textContent = '↻…'; $('ref-btn').disabled = true;
+  for (let i = 0; i < S.wl.length; i++) {
     await loadQuote(S.wl[i].ticker);
-    if (i<S.wl.length-1) await sleep(13000);
+    if (i < S.wl.length - 1) await RL.wait();
   }
-  $('ref-btn').textContent='↻ Refresh'; $('ref-btn').disabled=false;
-  toast('Watchlist refreshed','ok');
+  $('ref-btn').textContent = '↻ Refresh'; $('ref-btn').disabled = false;
+  toast('Watchlist refreshed', 'ok');
 };
 $('scan-btn').onclick  = scanAll;
 $('alert-btn').onclick = openDrawer;
@@ -1743,14 +1848,15 @@ function closeDrawer() { $('drawer').classList.remove('open'); $('drw-bg').class
 
 // Keyboard shortcuts
 document.addEventListener('keydown', e => {
-  if (e.target.tagName==='INPUT') return;
-  if (e.key==='a'||e.key==='A') { $('add-btn').click(); }
-  if (e.key==='Escape') { closeModal(); closeDrawer(); }
-  if (e.key==='r'||e.key==='R') $('ref-btn').click();
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'Escape') closeDrawer();
+  if (e.key === 'r' || e.key === 'R') $('ref-btn').click();
+  if (e.key === 'f' || e.key === 'F') { $('wl-add-input').focus(); e.preventDefault(); }
 });
 
 $('api-key').addEventListener('input', () => {
-  const v=$('api-key').value.trim(); if(v) localStorage.setItem('dtp_key',v);
+  const v = $('api-key').value.trim();
+  if (v) localStorage.setItem('dtp_key', v);
 });
 
 // ════════════════════════════════════════════════════
@@ -1806,7 +1912,7 @@ async function autoScan() {
         });
       }
     }
-    if (i < AUTO_SCAN_TICKERS.length - 1) await sleep(13000);
+    // RL inside apiFetch handles the gap — no manual sleep needed
   }
 
   // Sort strongest first
